@@ -61,3 +61,70 @@ proc cluster_allocate_slots {n} {
         R $j cluster addslots {*}[set slots_${j}]
     }
 }
+
+# Check that cluster nodes agree about "state", or raise an error.
+proc assert_cluster_state {state} {
+    foreach_redis_id id {
+        if {[instance_is_killed redis $id]} continue
+        wait_for_condition 1000 50 {
+            [CI $id cluster_state] eq $state
+        } else {
+            fail "Cluster node $id cluster_state:[CI $id cluster_state]"
+        }
+    }
+}
+
+# Search the first node starting from ID $first that is not
+# already configured as a slave.
+proc cluster_find_available_slave {first} {
+    foreach_redis_id id {
+        if {$id < $first} continue
+        if {[instance_is_killed redis $id]} continue
+        set me [get_myself $id]
+        if {[dict get $me slaveof] eq {-}} {return $id}
+    }
+    fail "No available slaves"
+}
+
+# Add 'slaves' slaves to a cluster composed of 'masters' masters.
+# It assumes that masters are allocated sequentially from instance ID 0
+# to N-1.
+proc cluster_allocate_slaves {masters slaves} {
+    for {set j 0} {$j < $slaves} {incr j} {
+        set master_id [expr {$j % $masters}]
+        set slave_id [cluster_find_available_slave $masters]
+        set master_myself [get_myself $master_id]
+        R $slave_id cluster replicate [dict get $master_myself id]
+    }
+}
+
+# Create a cluster composed of the specified number of masters and slaves.
+proc create_cluster {masters slaves} {
+    cluster_allocate_slots $masters
+    if {$slaves} {
+        cluster_allocate_slaves $masters $slaves
+    }
+    assert_cluster_state ok
+}
+
+# Set the cluster node-timeout to all the reachalbe nodes.
+proc set_cluster_node_timeout {to} {
+    foreach_redis_id id {
+        catch {R $id CONFIG SET cluster-node-timeout $to}
+    }
+}
+
+# Check if the cluster is writable and readable. Use node "id"
+# as a starting point to talk with the cluster.
+proc cluster_write_test {id} {
+    set prefix [randstring 20 20 alpha]
+    set port [get_instance_attrib redis $id port]
+    set cluster [redis_cluster 127.0.0.1:$port]
+    for {set j 0} {$j < 100} {incr j} {
+        $cluster set key.$j $prefix.$j
+    }
+    for {set j 0} {$j < 100} {incr j} {
+        assert {[$cluster get key.$j] eq "$prefix.$j"}
+    }
+    $cluster close
+}

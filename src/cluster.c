@@ -70,6 +70,8 @@ void clusterDoBeforeSleep(int flags);
 void clusterSendUpdate(clusterLink *link, clusterNode *node);
 void resetManualFailover(void);
 void clusterCloseAllSlots(void);
+void clusterSetNodeAsMaster(clusterNode *n);
+void clusterDelNode(clusterNode *delnode);
 
 /* -----------------------------------------------------------------------------
  * Initialization
@@ -102,7 +104,7 @@ int clusterLoadConfig(char *filename) {
     struct stat sb;
     char *line;
     int maxline, j;
-   
+
     if (fp == NULL) {
         if (errno == ENOENT) {
             return REDIS_ERR;
@@ -304,6 +306,8 @@ int clusterSaveConfig(int do_fsync) {
     struct stat sb;
     int fd;
 
+    server.cluster->todo_before_sleep &= ~CLUSTER_TODO_SAVE_CONFIG;
+
     /* Get the nodes description and concatenate our "vars" directive to
      * save currentEpoch and lastVoteEpoch. */
     ci = clusterGenNodesDescription(REDIS_NODE_HANDSHAKE);
@@ -311,7 +315,7 @@ int clusterSaveConfig(int do_fsync) {
         (unsigned long long) server.cluster->currentEpoch,
         (unsigned long long) server.cluster->lastVoteEpoch);
     content_size = sdslen(ci);
-    
+
     if ((fd = open(server.cluster_configfile,O_WRONLY|O_CREAT,0644))
         == -1) goto err;
 
@@ -323,7 +327,10 @@ int clusterSaveConfig(int do_fsync) {
         }
     }
     if (write(fd,ci,sdslen(ci)) != (ssize_t)sdslen(ci)) goto err;
-    if (do_fsync) fsync(fd);
+    if (do_fsync) {
+        server.cluster->todo_before_sleep &= ~CLUSTER_TODO_FSYNC_CONFIG;
+        fsync(fd);
+    }
 
     /* Truncate the file if needed to remove the final \n padding that
      * is just garbage. */
@@ -462,6 +469,65 @@ void clusterInit(void) {
     resetManualFailover();
 }
 
+/* Reset a node performing a soft or hard reset:
+ *
+ * 1) All other nodes are forget.
+ * 2) All the assigned / open slots are released.
+ * 3) If the node is a slave, it turns into a master.
+ * 5) Only for hard reset: a new Node ID is generated.
+ * 6) Only for hard reset: currentEpoch and configEpoch are set to 0.
+ * 7) The new configuration is saved and the cluster state updated.  */
+void clusterReset(int hard) {
+    dictIterator *di;
+    dictEntry *de;
+    int j;
+
+    /* Turn into master. */
+    if (nodeIsSlave(myself)) {
+        clusterSetNodeAsMaster(myself);
+        replicationUnsetMaster();
+    }
+
+    /* Close slots, reset manual failover state. */
+    clusterCloseAllSlots();
+    resetManualFailover();
+
+    /* Unassign all the slots. */
+    for (j = 0; j < REDIS_CLUSTER_SLOTS; j++) clusterDelSlot(j);
+
+    /* Forget all the nodes, but myself. */
+    di = dictGetSafeIterator(server.cluster->nodes);
+    while((de = dictNext(di)) != NULL) {
+        clusterNode *node = dictGetVal(de);
+
+        if (node == myself) continue;
+        clusterDelNode(node);
+    }
+    dictReleaseIterator(di);
+
+    /* Hard reset only: set epochs to 0, change node ID. */
+    if (hard) {
+        sds oldname;
+
+        server.cluster->currentEpoch = 0;
+        server.cluster->lastVoteEpoch = 0;
+        myself->configEpoch = 0;
+
+        /* To change the Node ID we need to remove the old name from the
+         * nodes table, change the ID, and re-add back with new name. */
+        oldname = sdsnewlen(myself->name, REDIS_CLUSTER_NAMELEN);
+        dictDelete(server.cluster->nodes,oldname);
+        sdsfree(oldname);
+        getRandomHexChars(myself->name, REDIS_CLUSTER_NAMELEN);
+        clusterAddNode(myself);
+    }
+
+    /* Make sure to persist the new config and update the state. */
+    clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
+                         CLUSTER_TODO_UPDATE_STATE|
+                         CLUSTER_TODO_FSYNC_CONFIG);
+}
+
 /* -----------------------------------------------------------------------------
  * CLUSTER communication link
  * -------------------------------------------------------------------------- */
@@ -501,6 +567,10 @@ void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     REDIS_NOTUSED(el);
     REDIS_NOTUSED(mask);
     REDIS_NOTUSED(privdata);
+
+    /* If the server is starting up, don't accept cluster connections:
+     * UPDATE messages may interact with the database content. */
+    if (server.masterhost == NULL && server.loading) return;
 
     while(max--) {
         cfd = anetTcpAccept(server.neterr, fd, cip, sizeof(cip), &cport);
@@ -747,7 +817,7 @@ void freeClusterNode(clusterNode *n) {
 /* Add a node to the nodes hash table */
 int clusterAddNode(clusterNode *node) {
     int retval;
-    
+
     retval = dictAdd(server.cluster->nodes,
             sdsnewlen(node->name,REDIS_CLUSTER_NAMELEN), node);
     return (retval == DICT_OK) ? REDIS_OK : REDIS_ERR;
@@ -810,7 +880,7 @@ clusterNode *clusterLookupNode(char *name) {
 void clusterRenameNode(clusterNode *node, char *newname) {
     int retval;
     sds s = sdsnewlen(node->name, REDIS_CLUSTER_NAMELEN);
-   
+
     redisLog(REDIS_DEBUG,"Renaming node %.40s into %.40s",
         node->name, newname);
     retval = dictDelete(server.cluster->nodes, s);
@@ -1212,6 +1282,15 @@ void clusterSetNodeAsMaster(clusterNode *n) {
 void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoch, unsigned char *slots) {
     int j;
     clusterNode *curmaster, *newmaster = NULL;
+    /* The dirty slots list is a list of slots for which we lose the ownership
+     * while having still keys inside. This usually happens after a failover
+     * or after a manual cluster reconfiguration operated by the admin.
+     *
+     * If the update message is not able to demote a master to slave (in this
+     * case we'll resync with the master updating the whole key space), we
+     * need to delete all the keys in the slots we lost ownership. */
+    uint16_t dirty_slots[REDIS_CLUSTER_SLOTS];
+    int dirty_slots_count = 0;
 
     /* Here we set curmaster to this node or the node this node
      * replicates to if it's a slave. In the for loop we are
@@ -1241,25 +1320,14 @@ void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoc
             if (server.cluster->slots[j] == NULL ||
                 server.cluster->slots[j]->configEpoch < senderConfigEpoch)
             {
-                /* Was this slot mine, and still contains keys? Something
-                 * odd happened, put the slot in importing state so that
-                 * redis-trib fix can detect the condition (and no further
-                 * updates will be processed before the slot gets fixed). */
+                /* Was this slot mine, and still contains keys? Mark it as
+                 * a dirty slot. */
                 if (server.cluster->slots[j] == myself &&
                     countKeysInSlot(j) &&
                     sender != myself)
                 {
-                    redisLog(REDIS_WARNING,
-                        "I received an update for slot %d. "
-                        "%.40s claims it with config %llu, "
-                        "I've it assigned to myself with config %llu. "
-                        "I've still keys about this slot! "
-                        "Putting the slot in IMPORTING state. "
-                        "Please run the 'redis-trib fix' command.",
-                        j, sender->name,
-                        (unsigned long long) senderConfigEpoch,
-                        (unsigned long long) myself->configEpoch);
-                    server.cluster->importing_slots_from[j] = sender;
+                    dirty_slots[dirty_slots_count] = j;
+                    dirty_slots_count++;
                 }
 
                 if (server.cluster->slots[j] == curmaster)
@@ -1288,6 +1356,16 @@ void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoc
         clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
                              CLUSTER_TODO_UPDATE_STATE|
                              CLUSTER_TODO_FSYNC_CONFIG);
+    } else if (dirty_slots_count) {
+        /* If we are here, we received an update message which removed
+         * ownership for certain slots we still have keys about, but still
+         * we are serving some slots, so this master node was not demoted to
+         * a slave.
+         *
+         * In order to maintain a consistent state between keys and slots
+         * we need to remove all the keys from the slots we lost. */
+        for (j = 0; j < dirty_slots_count; j++)
+            delKeysInSlot(dirty_slots[j]);
     }
 }
 
@@ -1771,7 +1849,7 @@ int clusterProcessPacket(clusterLink *link) {
 /* This function is called when we detect the link with this node is lost.
    We set the node as no longer connected. The Cluster Cron will detect
    this connection and will try to get it connected again.
-   
+
    Instead if the node is a temporary node used to accept a query, we
    completely free the node on error. */
 void handleLinkIOError(clusterLink *link) {
@@ -1881,7 +1959,7 @@ void clusterSendMessage(clusterLink *link, unsigned char *msg, size_t msglen) {
 
 /* Send a message to all the nodes that are part of the cluster having
  * a connected link.
- * 
+ *
  * It is guaranteed that this function will never have as a side effect
  * some node->link to be invalidated, so it is safe to call this function
  * from event handlers that will do stuff with node links later. */
@@ -1975,7 +2053,7 @@ void clusterSendPing(clusterLink *link, int type) {
     if (link->node && type == CLUSTERMSG_TYPE_PING)
         link->node->ping_sent = mstime();
     clusterBuildMessageHdr(hdr,type);
-        
+
     /* Populate the gossip fields */
     while(freshnodes > 0 && gossipcount < 3) {
         dictEntry *de = dictGetRandomKey(server.cluster->nodes);
@@ -2294,6 +2372,8 @@ void clusterHandleSlaveFailover(void) {
     int j;
     mstime_t auth_timeout, auth_retry_time;
 
+    server.cluster->todo_before_sleep &= ~CLUSTER_TODO_HANDLE_FAILOVER;
+
     /* Compute the failover timeout (the max time we have to send votes
      * and wait for replies), and the failover retry time (the time to wait
      * before waiting again.
@@ -2305,7 +2385,8 @@ void clusterHandleSlaveFailover(void) {
     if (auth_timeout < 2000) auth_timeout = 2000;
     auth_retry_time = auth_timeout*2;
 
-    /* Pre conditions to run the function:
+    /* Pre conditions to run the function, that must be met both in case
+     * of an automatic or manual failover:
      * 1) We are a slave.
      * 2) Our master is flagged as FAIL, or this is a manual failover.
      * 3) It is serving slots. */
@@ -2317,9 +2398,10 @@ void clusterHandleSlaveFailover(void) {
     /* Set data_age to the number of seconds we are disconnected from
      * the master. */
     if (server.repl_state == REDIS_REPL_CONNECTED) {
-        data_age = (server.unixtime - server.master->lastinteraction) * 1000;
+        data_age = (mstime_t)(server.unixtime - server.master->lastinteraction)
+                   * 1000;
     } else {
-        data_age = (server.unixtime - server.repl_down_since) * 1000;
+        data_age = (mstime_t)(server.unixtime - server.repl_down_since) * 1000;
     }
 
     /* Remove the node timeout from the data age as it is fine that we are
@@ -2328,13 +2410,17 @@ void clusterHandleSlaveFailover(void) {
     if (data_age > server.cluster_node_timeout)
         data_age -= server.cluster_node_timeout;
 
-    /* Check if our data is recent enough. For now we just use a fixed
-     * constant of ten times the node timeout since the cluster should
-     * react much faster to a master down. */
-    if (data_age >
-        (server.repl_ping_slave_period * 1000) +
-        (server.cluster_node_timeout * REDIS_CLUSTER_SLAVE_VALIDITY_MULT))
-        return;
+    /* Check if our data is recent enough according to the slave validity
+     * factor configured by the user.
+     *
+     * Check bypassed for manual failovers. */
+    if (server.cluster_slave_validity_factor &&
+        data_age >
+        (((mstime_t)server.repl_ping_slave_period * 1000) +
+         (server.cluster_node_timeout * server.cluster_slave_validity_factor)))
+    {
+        if (!manual_failover) return;
+    }
 
     /* If the previous failover attempt timedout and the retry time has
      * elapsed, we can setup a new one. */
@@ -2370,7 +2456,9 @@ void clusterHandleSlaveFailover(void) {
 
     /* It is possible that we received more updated offsets from other
      * slaves for the same master since we computed our election delay.
-     * Update the delay if our rank changed. */
+     * Update the delay if our rank changed.
+     *
+     * Not performed if this is a manual failover. */
     if (server.cluster->failover_auth_sent == 0 &&
         server.cluster->mf_end == 0)
     {
@@ -2416,10 +2504,7 @@ void clusterHandleSlaveFailover(void) {
          * this slave to a master.
          *
          * 1) Turn this node into a master. */
-        clusterNodeRemoveSlave(myself->slaveof, myself);
-        myself->flags &= ~REDIS_NODE_SLAVE;
-        myself->flags |= REDIS_NODE_MASTER;
-        myself->slaveof = NULL;
+        clusterSetNodeAsMaster(myself);
         replicationUnsetMaster();
 
         /* 2) Claim all the slots assigned to our master. */
@@ -2863,7 +2948,8 @@ void clusterBeforeSleep(void) {
         clusterSaveConfigOrDie(fsync);
     }
 
-    /* Reset our flags. */
+    /* Reset our flags (not strictly needed since every single function
+     * called for flags set should be able to clear its flag). */
     server.cluster->todo_before_sleep = 0;
 }
 
@@ -2980,6 +3066,8 @@ void clusterUpdateState(void) {
     static mstime_t among_minority_time;
     static mstime_t first_call_time = 0;
 
+    server.cluster->todo_before_sleep &= ~CLUSTER_TODO_UPDATE_STATE;
+
     /* If this is a master node, wait some time before turning the state
      * into OK, since it is not a good idea to rejoin the cluster as a writable
      * master, after a reboot, without giving the cluster a chance to
@@ -2988,6 +3076,7 @@ void clusterUpdateState(void) {
      * to don't count the DB loading time. */
     if (first_call_time == 0) first_call_time = mstime();
     if (nodeIsMaster(myself) &&
+        server.cluster->state == REDIS_CLUSTER_FAIL &&
         mstime() - first_call_time < REDIS_CLUSTER_WRITABLE_DELAY) return;
 
     /* Start assuming the state is OK. We'll turn it into FAIL if there
@@ -3032,7 +3121,7 @@ void clusterUpdateState(void) {
      * of the netsplit because of lack of majority. */
     {
         int needed_quorum = (server.cluster->size / 2) + 1;
-        
+
         if (unreachable_masters >= needed_quorum) {
             new_state = REDIS_CLUSTER_FAIL;
             among_minority_time = mstime();
@@ -3639,13 +3728,27 @@ void clusterCommand(redisClient *c) {
             addReplyBulkCString(c,ni);
             sdsfree(ni);
         }
-    } else if (!strcasecmp(c->argv[1]->ptr,"failover") && c->argc == 2) {
-        /* CLUSTER FAILOVER */
+    } else if (!strcasecmp(c->argv[1]->ptr,"failover") &&
+               (c->argc == 2 || c->argc == 3))
+    {
+        /* CLUSTER FAILOVER [FORCE] */
+        int force = 0;
+
+        if (c->argc == 3) {
+            if (!strcasecmp(c->argv[2]->ptr,"force")) {
+                force = 1;
+            } else {
+                addReply(c,shared.syntaxerr);
+                return;
+            }
+        }
+
         if (nodeIsMaster(myself)) {
             addReplyError(c,"You should send CLUSTER FAILOVER to a slave");
             return;
-        } else if (myself->slaveof == NULL || nodeFailed(myself->slaveof) ||
-                   myself->slaveof->link == NULL)
+        } else if (!force &&
+                   (myself->slaveof == NULL || nodeFailed(myself->slaveof) ||
+                   myself->slaveof->link == NULL))
         {
             addReplyError(c,"Master is down or failed, "
                             "please use CLUSTER FAILOVER FORCE");
@@ -3653,7 +3756,15 @@ void clusterCommand(redisClient *c) {
         }
         resetManualFailover();
         server.cluster->mf_end = mstime() + REDIS_CLUSTER_MF_TIMEOUT;
-        clusterSendMFStart(myself->slaveof);
+
+        /* If this is a forced failover, we don't need to talk with our master
+         * to agree about the offset. We just failover taking over it without
+         * coordination. */
+        if (force) {
+            server.cluster->mf_can_start = 1;
+        } else {
+            clusterSendMFStart(myself->slaveof);
+        }
         redisLog(REDIS_WARNING,"Manual failover user request accepted.");
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"set-config-epoch") && c->argc == 3)
@@ -3686,6 +3797,33 @@ void clusterCommand(redisClient *c) {
                                  CLUSTER_TODO_SAVE_CONFIG);
             addReply(c,shared.ok);
         }
+    } else if (!strcasecmp(c->argv[1]->ptr,"reset") &&
+               (c->argc == 2 || c->argc == 3))
+    {
+        /* CLUSTER RESET [SOFT|HARD] */
+        int hard = 0;
+
+        /* Parse soft/hard argument. Default is soft. */
+        if (c->argc == 3) {
+            if (!strcasecmp(c->argv[2]->ptr,"hard")) {
+                hard = 1;
+            } else if (!strcasecmp(c->argv[2]->ptr,"soft")) {
+                hard = 0;
+            } else {
+                addReply(c,shared.syntaxerr);
+                return;
+            }
+        }
+
+        /* Slaves can be reset while containing data, but not master nodes
+         * that must be empty. */
+        if (nodeIsMaster(myself) && dictSize(c->db->dict) != 0) {
+            addReplyError(c,"CLUSTER RESET can't be called with "
+                            "master nodes containing keys");
+            return;
+        }
+        clusterReset(hard);
+        addReply(c,shared.ok);
     } else {
         addReplyError(c,"Wrong CLUSTER subcommand or number of arguments");
     }
@@ -3986,7 +4124,7 @@ try_again:
         addReplySds(c,sdsnew("+NOKEY\r\n"));
         return;
     }
-    
+
     /* Connect */
     fd = migrateGetSocket(c,c->argv[1],c->argv[2],timeout);
     if (fd == -1) return; /* error sent to the client by migrateGetSocket() */

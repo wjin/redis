@@ -237,7 +237,9 @@ int luaRedisGenericCommand(lua_State *lua, int raise_error) {
         if (obj_s == NULL) break; /* Not a string. */
 
         /* Try to use a cached object. */
-        if (cached_objects[j] && cached_objects_len[j] >= obj_len) {
+        if (j < LUA_CMD_OBJCACHE_SIZE && cached_objects[j] && 
+            cached_objects_len[j] >= obj_len) 
+        {
             char *s = cached_objects[j]->ptr;
             struct sdshdr *sh = (void*)(s-(sizeof(struct sdshdr)));
 
@@ -250,7 +252,7 @@ int luaRedisGenericCommand(lua_State *lua, int raise_error) {
             argv[j] = createStringObject(obj_s, obj_len);
         }
     }
-    
+
     /* Check if one of the arguments passed by the Lua script
      * is not a string or an integer (lua_isstring() return true for
      * integers as well). */
@@ -532,7 +534,7 @@ void luaLoadLibraries(lua_State *lua) {
     luaLoadLib(lua, LUA_TABLIBNAME, luaopen_table);
     luaLoadLib(lua, LUA_STRLIBNAME, luaopen_string);
     luaLoadLib(lua, LUA_MATHLIBNAME, luaopen_math);
-    luaLoadLib(lua, LUA_DBLIBNAME, luaopen_debug); 
+    luaLoadLib(lua, LUA_DBLIBNAME, luaopen_debug);
     luaLoadLib(lua, "cjson", luaopen_cjson);
     luaLoadLib(lua, "struct", luaopen_struct);
     luaLoadLib(lua, "cmsgpack", luaopen_cmsgpack);
@@ -954,7 +956,7 @@ void evalGenericCommand(redisClient *c, int evalsha) {
 
     /* Select the right DB in the context of the Lua client */
     selectDb(server.lua_client,c->db->id);
-    
+
     /* Set a hook in order to be able to stop the script execution if it
      * is running for too much time.
      * We set the hook only if the time limit is enabled as the hook will

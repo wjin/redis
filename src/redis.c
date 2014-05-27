@@ -304,11 +304,21 @@ void redisLogRaw(int level, const char *msg) {
     } else {
         int off;
         struct timeval tv;
+        int role_char;
+        pid_t pid = getpid();
 
         gettimeofday(&tv,NULL);
         off = strftime(buf,sizeof(buf),"%d %b %H:%M:%S.",localtime(&tv.tv_sec));
         snprintf(buf+off,sizeof(buf)-off,"%03d",(int)tv.tv_usec/1000);
-        fprintf(fp,"[%d] %s %c %s\n",(int)getpid(),buf,c[level],msg);
+        if (server.sentinel_mode) {
+            role_char = 'X'; /* Sentinel. */
+        } else if (pid != server.pid) {
+            role_char = 'C'; /* RDB / AOF writing child. */
+        } else {
+            role_char = (server.masterhost ? 'S':'M'); /* Slave or Master. */
+        }
+        fprintf(fp,"%d:%c %s %c %s\n",
+            (int)getpid(),role_char, buf,c[level],msg);
     }
     fflush(fp);
 
@@ -349,9 +359,8 @@ void redisLogFromHandler(int level, const char *msg) {
                          open(server.logfile, O_APPEND|O_CREAT|O_WRONLY, 0644);
     if (fd == -1) return;
     ll2string(buf,sizeof(buf),getpid());
-    if (write(fd,"[",1) == -1) goto err;
     if (write(fd,buf,strlen(buf)) == -1) goto err;
-    if (write(fd," | signal handler] (",20) == -1) goto err;
+    if (write(fd,":signal-handler (",17) == -1) goto err;
     ll2string(buf,sizeof(buf),time(NULL));
     if (write(fd,buf,strlen(buf)) == -1) goto err;
     if (write(fd,") ",2) == -1) goto err;
@@ -1434,6 +1443,7 @@ void initServerConfig() {
     server.cluster_enabled = 0;
     server.cluster_node_timeout = REDIS_CLUSTER_DEFAULT_NODE_TIMEOUT;
     server.cluster_migration_barrier = REDIS_CLUSTER_DEFAULT_MIGRATION_BARRIER;
+    server.cluster_slave_validity_factor = REDIS_CLUSTER_DEFAULT_SLAVE_VALIDITY;
     server.cluster_configfile = zstrdup(REDIS_DEFAULT_CLUSTER_CONFIG_FILE);
     server.lua_caller = NULL;
     server.lua_time_limit = REDIS_LUA_TIME_LIMIT;
@@ -1686,6 +1696,7 @@ void initServer() {
             server.syslog_facility);
     }
 
+    server.pid = getpid();
     server.current_client = NULL;
     server.clients = listCreate();
     server.clients_to_close = listCreate();
