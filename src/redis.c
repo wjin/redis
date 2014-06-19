@@ -243,6 +243,7 @@ struct redisCommand redisCommandTable[] = {
     {"pttl",pttlCommand,2,"r",0,NULL,1,1,1,0,0},
     {"persist",persistCommand,2,"w",0,NULL,1,1,1,0,0},
     {"slaveof",slaveofCommand,3,"ast",0,NULL,0,0,0,0,0},
+    {"role",roleCommand,1,"ast",0,NULL,0,0,0,0,0},
     {"debug",debugCommand,-2,"as",0,NULL,0,0,0,0,0},
     {"config",configCommand,-2,"art",0,NULL,0,0,0,0,0},
     {"subscribe",subscribeCommand,-2,"rpslt",0,NULL,0,0,0,0,0},
@@ -1450,6 +1451,7 @@ void initServerConfig() {
     server.lua_client = NULL;
     server.lua_timedout = 0;
     server.migrate_cached_sockets = dictCreate(&migrateCacheDictType,NULL);
+    server.next_client_id = 1; /* Client IDs, start from 1 .*/
     server.loading_process_events_interval_bytes = (1024*1024*2);
 
     server.lruclock = getLRUClock();
@@ -1484,7 +1486,7 @@ void initServerConfig() {
     server.repl_no_slaves_since = time(NULL);
 
     /* Client output buffer limits */
-    for (j = 0; j < REDIS_CLIENT_LIMIT_NUM_CLASSES; j++)
+    for (j = 0; j < REDIS_CLIENT_TYPE_COUNT; j++)
         server.client_obuf_limits[j] = clientBufferLimitsDefaults[j];
 
     /* Double constants initialization */
@@ -2170,7 +2172,8 @@ int processCommand(redisClient *c) {
 
     /* Don't accept write commands if there are not enough good slaves and
      * user configured the min-slaves-to-write option. */
-    if (server.repl_min_slaves_to_write &&
+    if (server.masterhost == NULL &&
+        server.repl_min_slaves_to_write &&
         server.repl_min_slaves_max_lag &&
         c->cmd->flags & REDIS_CMD_WRITE &&
         server.repl_good_slaves_count < server.repl_min_slaves_to_write)

@@ -232,13 +232,23 @@ int luaRedisGenericCommand(lua_State *lua, int raise_error) {
     for (j = 0; j < argc; j++) {
         char *obj_s;
         size_t obj_len;
+        char dbuf[64];
 
-        obj_s = (char*)lua_tolstring(lua,j+1,&obj_len);
-        if (obj_s == NULL) break; /* Not a string. */
+        if (lua_type(lua,j+1) == LUA_TNUMBER) {
+            /* We can't use lua_tolstring() for number -> string conversion
+             * since Lua uses a format specifier that loses precision. */
+            lua_Number num = lua_tonumber(lua,j+1);
+
+            obj_len = snprintf(dbuf,sizeof(dbuf),"%.17g",(double)num);
+            obj_s = dbuf;
+        } else {
+            obj_s = (char*)lua_tolstring(lua,j+1,&obj_len);
+            if (obj_s == NULL) break; /* Not a string. */
+        }
 
         /* Try to use a cached object. */
-        if (j < LUA_CMD_OBJCACHE_SIZE && cached_objects[j] && 
-            cached_objects_len[j] >= obj_len) 
+        if (j < LUA_CMD_OBJCACHE_SIZE && cached_objects[j] &&
+            cached_objects_len[j] >= obj_len)
         {
             char *s = cached_objects[j]->ptr;
             struct sdshdr *sh = (void*)(s-(sizeof(struct sdshdr)));
@@ -984,7 +994,6 @@ void evalGenericCommand(redisClient *c, int evalsha) {
                           readQueryFromClient,c);
     }
     server.lua_caller = NULL;
-    selectDb(c,server.lua_client->db->id); /* set DB ID from Lua client */
 
     /* Call the Lua garbage collector from time to time to avoid a
      * full cycle performed by Lua, which adds too latency.

@@ -88,7 +88,7 @@ typedef struct sentinelAddr {
 
 /* Failover machine different states. */
 #define SENTINEL_FAILOVER_STATE_NONE 0  /* No failover in progress. */
-#define SENTINEL_FAILOVER_STATE_WAIT_START 1  /* Wait for failover_start_time*/ 
+#define SENTINEL_FAILOVER_STATE_WAIT_START 1  /* Wait for failover_start_time*/
 #define SENTINEL_FAILOVER_STATE_SELECT_SLAVE 2 /* Select slave to promote */
 #define SENTINEL_FAILOVER_STATE_SEND_SLAVEOF_NOONE 3 /* Slave -> Master */
 #define SENTINEL_FAILOVER_STATE_WAIT_PROMOTION 4 /* Wait slave to change role */
@@ -2875,7 +2875,7 @@ void sentinelCheckSubjectivelyDown(sentinelRedisInstance *ri) {
     if (ri->last_ping_time)
         elapsed = mstime() - ri->last_ping_time;
 
-    /* Check if we are in need for a reconnection of one of the 
+    /* Check if we are in need for a reconnection of one of the
      * links, because we are detecting low activity.
      *
      * 1) Check if the command link seems connected, was connected not less
@@ -3203,21 +3203,53 @@ int sentinelSendSlaveOf(sentinelRedisInstance *ri, char *host, int port) {
 
     ll2string(portstr,sizeof(portstr),port);
 
+    /* If host is NULL we send SLAVEOF NO ONE that will turn the instance
+     * into a master. */
     if (host == NULL) {
         host = "NO";
         memcpy(portstr,"ONE",4);
     }
 
+    /* In order to send SLAVEOF in a safe way, we send a transaction performing
+     * the following tasks:
+     * 1) Reconfigure the instance according to the specified host/port params.
+     * 2) Rewrite the configuraiton.
+     * 3) Disconnect all clients (but this one sending the commnad) in order
+     *    to trigger the ask-master-on-reconnection protocol for connected
+     *    clients.
+     *
+     * Note that we don't check the replies returned by commands, since we
+     * will observe instead the effects in the next INFO output. */
+    retval = redisAsyncCommand(ri->cc,
+        sentinelDiscardReplyCallback, NULL, "MULTI");
+    if (retval == REDIS_ERR) return retval;
+    ri->pending_commands++;
+
     retval = redisAsyncCommand(ri->cc,
         sentinelDiscardReplyCallback, NULL, "SLAVEOF %s %s", host, portstr);
     if (retval == REDIS_ERR) return retval;
-
     ri->pending_commands++;
-    if (redisAsyncCommand(ri->cc,
-        sentinelDiscardReplyCallback, NULL, "CONFIG REWRITE") == REDIS_OK)
-    {
-        ri->pending_commands++;
-    }
+
+    retval = redisAsyncCommand(ri->cc,
+        sentinelDiscardReplyCallback, NULL, "CONFIG REWRITE");
+    if (retval == REDIS_ERR) return retval;
+    ri->pending_commands++;
+
+    /* CLIENT KILL TYPE <type> is only supported starting from Redis 2.8.12,
+     * however sending it to an instance not understanding this command is not
+     * an issue because CLIENT is variadic command, so Redis will not
+     * recognized as a syntax error, and the transaction will not fail (but
+     * only the unsupported command will fail). */
+    retval = redisAsyncCommand(ri->cc,
+        sentinelDiscardReplyCallback, NULL, "CLIENT KILL TYPE normal");
+    if (retval == REDIS_ERR) return retval;
+    ri->pending_commands++;
+
+    retval = redisAsyncCommand(ri->cc,
+        sentinelDiscardReplyCallback, NULL, "EXEC");
+    if (retval == REDIS_ERR) return retval;
+    ri->pending_commands++;
+
     return REDIS_OK;
 }
 

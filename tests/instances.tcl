@@ -74,11 +74,13 @@ proc spawn_instance {type base_port count {conf {}}} {
         }
 
         # Push the instance into the right list
+        set link [redis 127.0.0.1 $port]
+        $link reconnect 1
         lappend ::${type}_instances [list \
             pid $pid \
             host 127.0.0.1 \
             port $port \
-            link [redis 127.0.0.1 $port] \
+            link $link \
         ]
     }
 }
@@ -141,6 +143,14 @@ proc pause_on_error {} {
         set cmd [lindex $argv 0]
         if {$cmd eq {continue}} {
             break
+        } elseif {$cmd eq {show-redis-logs}} {
+            set count 10
+            if {[lindex $argv 1] ne {}} {set count [lindex $argv 1]}
+            foreach_redis_id id {
+                puts "=== REDIS $id ===="
+                puts [exec tail -$count redis_$id/log.txt]
+                puts "---------------------\n"
+            }
         } elseif {$cmd eq {show-sentinel-logs}} {
             set count 10
             if {[lindex $argv 1] ne {}} {set count [lindex $argv 1]}
@@ -184,6 +194,7 @@ proc pause_on_error {} {
         } elseif {$cmd eq {help}} {
             puts "ls                     List Sentinel and Redis instances."
             puts "show-sentinel-logs \[N\] Show latest N lines of logs."
+            puts "show-redis-logs \[N\]    Show latest N lines of logs."
             puts "S <id> cmd ... arg     Call command in Sentinel <id>."
             puts "R <id> cmd ... arg     Call command in Redis <id>."
             puts "SI <id> <field>        Show Sentinel <id> INFO <field>."
@@ -389,6 +400,8 @@ proc restart_instance {type id} {
     }
 
     # Connect with it with a fresh link
-    set_instance_attrib $type $id link [redis 127.0.0.1 $port]
+    set link [redis 127.0.0.1 $port]
+    $link reconnect 1
+    set_instance_attrib $type $id link $link
 }
 

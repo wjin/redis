@@ -512,6 +512,7 @@ void clusterReset(int hard) {
         server.cluster->currentEpoch = 0;
         server.cluster->lastVoteEpoch = 0;
         myself->configEpoch = 0;
+        redisLog(REDIS_WARNING, "configEpoch set to 0 via CLUSTER RESET HARD");
 
         /* To change the Node ID we need to remove the old name from the
          * nodes table, change the ID, and re-add back with new name. */
@@ -1427,7 +1428,7 @@ void clusterHandleConfigEpochCollision(clusterNode *sender) {
     clusterSaveConfigOrDie(1);
     redisLog(REDIS_VERBOSE,
         "WARNING: configEpoch collision with node %.40s."
-        " Updating my configEpoch to %llu",
+        " configEpoch set to %llu",
         sender->name,
         (unsigned long long) myself->configEpoch);
 }
@@ -2287,23 +2288,63 @@ void clusterSendFailoverAuthIfNeeded(clusterNode *node, clusterMsg *request) {
      * size + 1 */
     if (nodeIsSlave(myself) || myself->numslots == 0) return;
 
-    /* Request epoch must be >= our currentEpoch. */
-    if (requestCurrentEpoch < server.cluster->currentEpoch) return;
+    /* Request epoch must be >= our currentEpoch.
+     * Note that it is impossible for it to actually be greater since
+     * our currentEpoch was updated as a side effect of receiving this
+     * request, if the request epoch was greater. */
+    if (requestCurrentEpoch < server.cluster->currentEpoch) {
+        redisLog(REDIS_WARNING,
+            "Failover auth denied to %.40s: reqEpoch (%llu) < curEpoch(%llu)",
+            node->name,
+            (unsigned long long) requestCurrentEpoch,
+            (unsigned long long) server.cluster->currentEpoch);
+        return;
+    }
 
     /* I already voted for this epoch? Return ASAP. */
-    if (server.cluster->lastVoteEpoch == server.cluster->currentEpoch) return;
+    if (server.cluster->lastVoteEpoch == server.cluster->currentEpoch) {
+        redisLog(REDIS_WARNING,
+                "Failover auth denied to %.40s: already voted for epoch %llu",
+                node->name,
+                (unsigned long long) server.cluster->currentEpoch);
+        return;
+    }
 
     /* Node must be a slave and its master down.
      * The master can be non failing if the request is flagged
      * with CLUSTERMSG_FLAG0_FORCEACK (manual failover). */
     if (nodeIsMaster(node) || master == NULL ||
-        (!nodeFailed(master) && !force_ack)) return;
+        (!nodeFailed(master) && !force_ack))
+    {
+        if (nodeIsMaster(node)) {
+            redisLog(REDIS_WARNING,
+                    "Failover auth denied to %.40s: it is a master node",
+                    node->name);
+        } else if (master == NULL) {
+            redisLog(REDIS_WARNING,
+                    "Failover auth denied to %.40s: I don't know its master",
+                    node->name);
+        } else if (!nodeFailed(master)) {
+            redisLog(REDIS_WARNING,
+                    "Failover auth denied to %.40s: its master is up",
+                    node->name);
+        }
+        return;
+    }
 
     /* We did not voted for a slave about this master for two
      * times the node timeout. This is not strictly needed for correctness
      * of the algorithm but makes the base case more linear. */
     if (mstime() - node->slaveof->voted_time < server.cluster_node_timeout * 2)
+    {
+        redisLog(REDIS_WARNING,
+                "Failover auth denied to %.40s: "
+                "can't vote about this master before %lld milliseconds",
+                node->name,
+                (long long) ((server.cluster_node_timeout*2)-
+                             (mstime() - node->slaveof->voted_time)));
         return;
+    }
 
     /* The slave requesting the vote must have a configEpoch for the claimed
      * slots that is >= the one of the masters currently serving the same
@@ -2318,6 +2359,12 @@ void clusterSendFailoverAuthIfNeeded(clusterNode *node, clusterMsg *request) {
         /* If we reached this point we found a slot that in our current slots
          * is served by a master with a greater configEpoch than the one claimed
          * by the slave requesting our vote. Refuse to vote for this slave. */
+        redisLog(REDIS_WARNING,
+                "Failover auth denied to %.40s: "
+                "slot %d epoch (%llu) > reqEpoch (%llu)",
+                node->name, j,
+                (unsigned long long) server.cluster->slots[j]->configEpoch,
+                (unsigned long long) requestConfigEpoch);
         return;
     }
 
@@ -2325,6 +2372,8 @@ void clusterSendFailoverAuthIfNeeded(clusterNode *node, clusterMsg *request) {
     clusterSendFailoverAuth(node);
     server.cluster->lastVoteEpoch = server.cluster->currentEpoch;
     node->slaveof->voted_time = mstime();
+    redisLog(REDIS_WARNING, "Failover auth granted to %.40s for epoch %llu",
+        node->name, (unsigned long long) server.cluster->currentEpoch);
 }
 
 /* This function returns the "rank" of this instance, a slave, in the context
@@ -2516,7 +2565,12 @@ void clusterHandleSlaveFailover(void) {
         }
 
         /* 3) Update my configEpoch to the epoch of the election. */
-        myself->configEpoch = server.cluster->failover_auth_epoch;
+        if (myself->configEpoch < server.cluster->failover_auth_epoch) {
+            myself->configEpoch = server.cluster->failover_auth_epoch;
+            redisLog(REDIS_WARNING,
+                "configEpoch set to %llu after successful failover",
+                (unsigned long long) myself->configEpoch);
+        }
 
         /* 4) Update state and save config. */
         clusterUpdateState();
@@ -3563,6 +3617,7 @@ void clusterCommand(redisClient *c) {
         /* CLUSTER INFO */
         char *statestr[] = {"ok","fail","needhelp"};
         int slots_assigned = 0, slots_ok = 0, slots_pfail = 0, slots_fail = 0;
+        uint64_t myepoch;
         int j;
 
         for (j = 0; j < REDIS_CLUSTER_SLOTS; j++) {
@@ -3579,6 +3634,9 @@ void clusterCommand(redisClient *c) {
             }
         }
 
+        myepoch = (nodeIsSlave(myself) && myself->slaveof) ?
+                  myself->slaveof->configEpoch : myself->configEpoch;
+
         sds info = sdscatprintf(sdsempty(),
             "cluster_state:%s\r\n"
             "cluster_slots_assigned:%d\r\n"
@@ -3588,6 +3646,7 @@ void clusterCommand(redisClient *c) {
             "cluster_known_nodes:%lu\r\n"
             "cluster_size:%d\r\n"
             "cluster_current_epoch:%llu\r\n"
+            "cluster_my_epoch:%llu\r\n"
             "cluster_stats_messages_sent:%lld\r\n"
             "cluster_stats_messages_received:%lld\r\n"
             , statestr[server.cluster->state],
@@ -3598,6 +3657,7 @@ void clusterCommand(redisClient *c) {
             dictSize(server.cluster->nodes),
             server.cluster->size,
             (unsigned long long) server.cluster->currentEpoch,
+            (unsigned long long) myepoch,
             server.cluster->stats_bus_messages_sent,
             server.cluster->stats_bus_messages_received
         );
@@ -3790,6 +3850,12 @@ void clusterCommand(redisClient *c) {
             addReplyError(c,"Node config epoch is already non-zero");
         } else {
             myself->configEpoch = epoch;
+            redisLog(REDIS_WARNING,
+                "configEpoch set to %llu via CLUSTER SET-CONFIG-EPOCH",
+                (unsigned long long) myself->configEpoch);
+
+            if (server.cluster->currentEpoch < epoch)
+                server.cluster->currentEpoch = epoch;
             /* No need to fsync the config here since in the unlucky event
              * of a failure to persist the config, the conflict resolution code
              * will assign an unique config to this node. */
