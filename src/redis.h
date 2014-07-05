@@ -69,7 +69,7 @@
 /* Static server configuration */
 #define REDIS_DEFAULT_HZ        10      /* Time interrupt calls/sec. */
 #define REDIS_MIN_HZ            1
-#define REDIS_MAX_HZ            500 
+#define REDIS_MAX_HZ            500
 #define REDIS_SERVERPORT        6379    /* TCP port */
 #define REDIS_TCP_BACKLOG       511     /* TCP listen backlog */
 #define REDIS_MAXIDLETIME       0       /* default client timeout: infinite */
@@ -366,6 +366,9 @@
 #define REDIS_NOTIFY_EXPIRED (1<<8)     /* x */
 #define REDIS_NOTIFY_EVICTED (1<<9)     /* e */
 #define REDIS_NOTIFY_ALL (REDIS_NOTIFY_GENERIC | REDIS_NOTIFY_STRING | REDIS_NOTIFY_LIST | REDIS_NOTIFY_SET | REDIS_NOTIFY_HASH | REDIS_NOTIFY_ZSET | REDIS_NOTIFY_EXPIRED | REDIS_NOTIFY_EVICTED)      /* A */
+
+/* Get the first bind addr or NULL */
+#define REDIS_BIND_ADDR (server.bindaddr_count ? server.bindaddr[0] : NULL)
 
 /* Using the following macro you can run code inside serverCron() with the
  * specified period, specified in milliseconds.
@@ -1324,6 +1327,7 @@ uint64_t redisBuildId(void);
 void authCommand(redisClient *c);
 void pingCommand(redisClient *c);
 void echoCommand(redisClient *c);
+void commandCommand(redisClient *c);
 void setCommand(redisClient *c);
 void setnxCommand(redisClient *c);
 void setexCommand(redisClient *c);
